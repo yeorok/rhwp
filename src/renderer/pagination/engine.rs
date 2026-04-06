@@ -246,7 +246,10 @@ impl Paginator {
                         p.controls.iter().any(|c|
                             matches!(c, Control::Equation(_)) ||
                             matches!(c, Control::Picture(pic) if pic.common.treat_as_char) ||
-                            matches!(c, Control::Shape(s) if s.common().treat_as_char))
+                            matches!(c, Control::Shape(s) if s.common().treat_as_char) ||
+                            // 글앞으로/글뒤로 Shape: vpos에 Shape 높이가 포함되어 과대 → bypass
+                            matches!(c, Control::Shape(s) if matches!(s.common().text_wrap,
+                                crate::model::shape::TextWrap::InFrontOfText | crate::model::shape::TextWrap::BehindText)))
                     }).unwrap_or(false);
                     if !prev_has_tac_eq {
                     if let Some(base) = st.page_vpos_base {
@@ -427,11 +430,17 @@ impl Paginator {
                 }
 
                 // 표 감지: 시각적 높이 저장 + Fixed 누적 시작 (Task #9)
+                // TAC 표의 높이는 이미 paginate_table_control에서 current_height에 반영됨
+                // fix_overlay는 고정값→글자에따라 전환이 있는 경우에만 유효
                 if let Some(seg) = para.line_segs.first() {
                     if seg.line_spacing < 0 {
                         fix_table_visual_h = crate::renderer::hwpunit_to_px(seg.line_height, self.dpi);
                         fix_vpos_tmp = 0.0;
                         fix_overlay_active = true;
+                    } else if has_tac_block_table {
+                        // 양수 ls의 TAC 표: fix_overlay 리셋
+                        // 이전 표의 fix_table_visual_h를 후속 비-표 문단에 이중 적용 방지
+                        fix_overlay_active = false;
                     }
                 }
             }
@@ -1055,10 +1064,24 @@ impl Paginator {
             effective_height + host_spacing
         };
 
+        // 비-TAC 자리차지 표: vert offset이 있으면 실제 배치 위치로 피트 판단
+        // 같은 문단의 여러 표가 각각 독립적인 vert offset을 가진 경우,
+        // current_height + vert_offset + 표높이가 페이지를 넘으면 다음 페이지로
+        let effective_table_height = if !is_tac_table
+            && matches!(table_text_wrap, crate::model::shape::TextWrap::TopAndBottom)
+            && matches!(table.common.vert_rel_to, crate::model::shape::VertRelTo::Para)
+            && table.common.vertical_offset > 0
+        {
+            let v_off = crate::renderer::hwpunit_to_px(table.common.vertical_offset as i32, self.dpi);
+            effective_height + host_spacing + v_off
+        } else {
+            table_total_height
+        };
+
         // 페이지 하단/중앙 고정 표: 본문 높이에 영향 없음
         // 표가 현재 페이지에 전체 들어가는지 확인
         // 텍스트 문단과 동일한 0.5px 부동소수점 톨러런스 적용
-        if st.current_height + table_total_height <= table_available_height + 0.5 {
+        if st.current_height + effective_table_height <= table_available_height + 0.5 {
             self.place_table_fits(st, para_idx, ctrl_idx, para, measured, table,
                 table_total_height, para_height, para_height_for_fit, is_tac_table);
         } else if is_tac_table {

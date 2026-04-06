@@ -1313,6 +1313,13 @@ impl LayoutEngine {
             if !shape_jumped && !prev_tac_seg_applied {
             if let Some(prev_pi) = prev_layout_para {
                 if item_para != prev_pi {
+                    // 글앞으로/글뒤로 Shape가 있는 문단: vpos에 Shape 높이가 포함되어 과대 → bypass
+                    let prev_has_overlay_shape = paragraphs.get(prev_pi).map(|p| {
+                        p.controls.iter().any(|c|
+                            matches!(c, Control::Shape(s) if matches!(s.common().text_wrap,
+                                crate::model::shape::TextWrap::InFrontOfText | crate::model::shape::TextWrap::BehindText)))
+                    }).unwrap_or(false);
+                    if !prev_has_overlay_shape {
                     if let Some(prev_para) = paragraphs.get(prev_pi) {
                         let prev_seg = prev_para.line_segs.iter().rev().find(|ls| {
                             ls.segment_width > 0 && (ls.segment_width - col_width_hu).abs() < 3000
@@ -1354,6 +1361,7 @@ impl LayoutEngine {
                     }
                 }
             }
+            } // !prev_has_overlay_shape
             } // !shape_jumped
             prev_layout_para = Some(item_para);
 
@@ -1791,12 +1799,14 @@ impl LayoutEngine {
             prev_tac_seg_applied, wrap_around_paras, ..
         } = ctx;
         // 표 앵커 문단의 y 위치 등록
-        // 같은 문단에 TAC(ci=0) 뒤 비-TAC(ci=1)가 올 때:
-        // 비-TAC 표는 TAC 배치 후의 y_offset을 기준으로 배치되어야 함
+        // TAC 표: 이전 TAC가 y_offset을 진행시킨 경우 갱신 (같은 문단 TAC+블록 구조)
+        // 비-TAC 표: 문단 시작 y를 유지 (각 표가 독립적으로 vert offset 기준 배치)
+        let is_current_tac = paragraphs.get(para_index)
+            .and_then(|p| p.controls.get(control_index))
+            .map(|c| matches!(c, Control::Table(t) if t.common.treat_as_char))
+            .unwrap_or(false);
         if let Some(existing_y) = para_start_y.get(&para_index) {
-            // 이미 등록된 y보다 현재 y_offset이 크면 갱신
-            // (이전 TAC 표가 y_offset을 진행시킨 경우)
-            if y_offset > *existing_y + 1.0 {
+            if is_current_tac && y_offset > *existing_y + 1.0 {
                 para_start_y.insert(para_index, y_offset);
             }
         } else {
@@ -2168,12 +2178,27 @@ impl LayoutEngine {
         let pt_mt = measured_tables.iter().find(|mt|
             mt.para_index == para_index && mt.control_index == control_index
         );
+        // 비-TAC 자리차지 표에서 vert offset이 있으면 문단 시작 y 전달
+        // layout_partial_table 내부에서 vert_offset을 적용하므로 이중 적용 방지
+        let pt_y_start = if let Some(para) = paragraphs.get(para_index) {
+            if let Some(Control::Table(t)) = para.controls.get(control_index) {
+                if !t.common.treat_as_char
+                    && matches!(t.common.text_wrap, crate::model::shape::TextWrap::TopAndBottom)
+                    && matches!(t.common.vert_rel_to, crate::model::shape::VertRelTo::Para)
+                    && t.common.vertical_offset > 0
+                {
+                    para_start_y.get(&para_index).copied().unwrap_or(y_offset)
+                } else {
+                    y_offset
+                }
+            } else { y_offset }
+        } else { y_offset };
         let pt_y_before = y_offset;
         y_offset = self.layout_partial_table(
             tree, col_node, paragraphs,
             para_index, control_index,
             page_content.section_index, styles, col_area,
-            y_offset, bin_data_content,
+            pt_y_start, bin_data_content,
             start_row, end_row, is_continuation,
             split_start_content_offset, split_end_content_limit,
             pt_margin_left, pt_margin_right, pt_mt,
